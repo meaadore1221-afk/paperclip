@@ -181,6 +181,47 @@ export function deduplicateAgentName(
   return `${candidateName} ${Date.now()}`;
 }
 
+export type OrgTreeNode<T extends { id: string; reportsTo: string | null }> = T & {
+  reports: Array<OrgTreeNode<T>>;
+};
+
+export function buildOrgTree<T extends { id: string; reportsTo: string | null }>(
+  rows: T[],
+): Array<OrgTreeNode<T>> {
+  const validIds = new Set(rows.map((row) => row.id));
+  const byManager = new Map<string | null, T[]>();
+  for (const row of rows) {
+    // Invalid manager links should not hide the agent from the org chart.
+    const managerId =
+      row.reportsTo && row.reportsTo !== row.id && validIds.has(row.reportsTo) ? row.reportsTo : null;
+    const group = byManager.get(managerId) ?? [];
+    group.push(row);
+    byManager.set(managerId, group);
+  }
+
+  const visited = new Set<string>();
+  const buildNode = (row: T, ancestry: Set<string>): OrgTreeNode<T> => {
+    visited.add(row.id);
+    const nextAncestry = new Set(ancestry);
+    nextAncestry.add(row.id);
+    const reports = (byManager.get(row.id) ?? [])
+      .filter((child) => !nextAncestry.has(child.id))
+      .map((child) => buildNode(child, nextAncestry));
+    return {
+      ...row,
+      reports,
+    };
+  };
+
+  const roots = (byManager.get(null) ?? []).map((row) => buildNode(row, new Set<string>()));
+  for (const row of rows) {
+    if (!visited.has(row.id)) {
+      roots.push(buildNode(row, new Set<string>()));
+    }
+  }
+  return roots;
+}
+
 export function agentService(db: Db) {
   function withUrlKey<T extends { id: string; name: string }>(row: T) {
     return {
@@ -558,23 +599,7 @@ export function agentService(db: Db) {
         .from(agents)
         .where(and(eq(agents.companyId, companyId), ne(agents.status, "terminated")));
       const normalizedRows = rows.map(normalizeAgentRow);
-      const byManager = new Map<string | null, typeof normalizedRows>();
-      for (const row of normalizedRows) {
-        const key = row.reportsTo ?? null;
-        const group = byManager.get(key) ?? [];
-        group.push(row);
-        byManager.set(key, group);
-      }
-
-      const build = (managerId: string | null): Array<Record<string, unknown>> => {
-        const members = byManager.get(managerId) ?? [];
-        return members.map((member) => ({
-          ...member,
-          reports: build(member.id),
-        }));
-      };
-
-      return build(null);
+      return buildOrgTree(normalizedRows);
     },
 
     getChainOfCommand: async (agentId: string) => {
